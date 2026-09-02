@@ -63,9 +63,10 @@ needed.
   with no shared vertices, so every other reader yields a mesh that needs
   *Remove Duplicate Vertices* afterwards. `tf::read_stl` routes through
   `tf::clean::polygon_soup`, so the mesh arrives welded.
-- **OBJ import recovers vertex positions and faces only** — no UVs, normals or
-  materials, by design in `tf::read_obj`. For a textured OBJ use `io_vcg` or
-  `io_obj_rapidobj`. This is a geometry-recovery reader.
+- **OBJ import recovers positions, faces, per-vertex normals and texture
+  coordinates** via `tf::read_obj(path, tf::complete)`; a position carrying
+  two distinct normals or texture coords arrives pre-split. Materials are
+  not read.
 - **Export writes triangles only**, and no attributes. `tf::write_stl` requires
   triangular polygons; n-gons are fan-triangulated on the way in and out.
 

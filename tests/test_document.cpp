@@ -70,6 +70,7 @@ private slots:
     void openDialogFilterContainsKnownFormats();
     void saveAndLoad3MFRoundTrip();
     void trueFormRoundTripsObjAndStl();
+    void trueFormImportsObjAttributes();
     void polygonalOffExportKeepsEveryWellFormedQuad();
     void plyWithLongPerVertexListLoads();
     void polygonalOffExportSurvivesMalformedFaces();
@@ -1428,6 +1429,85 @@ void DocumentTests::trueFormRoundTripsObjAndStl()
         QVERIFY2(std::abs(box.DimX() - 2.0f) < 1e-3f, qPrintable(ext));
         QVERIFY2(std::abs(box.DimY() - 3.0f) < 1e-3f, qPrintable(ext));
     }
+}
+
+void DocumentTests::trueFormImportsObjAttributes()
+{
+    Document probe;
+    const QString trueFormId = QStringLiteral("qmeshlab.io.trueform");
+    if (!probe.openDialogFilter().contains(QStringLiteral("TrueForm")))
+        QSKIP("TrueForm I/O plugin is not available in this build.");
+
+    // A quad and a cap triangle sharing two positions, each with its own
+    // normal and texture coordinates: the shared positions must arrive as
+    // split vertices carrying their own attributes.
+    const char *obj =
+        "o demo\n"
+        "g quad\n"
+        "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 0.5 0.5 1\n"
+        "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvt 0.5 0.5\n"
+        "vn 0 0 1\nvn 0 0.7071 0.7071\n"
+        "f 1/1/1 2/2/1 3/3/1 4/4/1\n"
+        "g cap\n"
+        "f 1/1/2 2/2/2 5/5/2\n";
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("textured.obj"));
+    {
+        QFile out(path);
+        QVERIFY(out.open(QIODevice::WriteOnly));
+        out.write(obj);
+    }
+
+    const QString previousObj = probe.preferredImportPluginForExtension(QStringLiteral("obj"));
+    struct PreferenceRestorer {
+        Document *doc;
+        QString obj;
+        ~PreferenceRestorer()
+        {
+            doc->setPreferredImportPluginForExtension(QStringLiteral("obj"), obj);
+        }
+    } restorer{ &probe, previousObj };
+    probe.setPreferredImportPluginForExtension(QStringLiteral("obj"), trueFormId);
+
+    QCOMPARE(probe.loadMesh(path), 0);
+    QCOMPARE(probe.meshCount(), 1);
+    const Document::MeshEntry &entry = probe.mesh(0);
+    const VCGMesh &mesh = entry.mesh;
+
+    // Fan of the quad plus the cap triangle; the two shared positions split.
+    QCOMPARE(mesh.FN(), 3);
+    QCOMPARE(mesh.VN(), 7);
+    QVERIFY(entry.ioMask & vcg::tri::io::Mask::IOM_VERTNORMAL);
+    QVERIFY(entry.ioMask & vcg::tri::io::Mask::IOM_WEDGTEXCOORD);
+
+    // Every wedge texcoord is one of the five source coordinates.
+    int checkedWedges = 0;
+    for (const VCGFace &f : mesh.face) {
+        if (f.IsD())
+            continue;
+        for (int w = 0; w < 3; ++w) {
+            const float u = f.cWT(w).U();
+            const float v = f.cWT(w).V();
+            const bool known = (u == 0.0f && v == 0.0f) || (u == 1.0f && v == 0.0f)
+                || (u == 1.0f && v == 1.0f) || (u == 0.0f && v == 1.0f)
+                || (u == 0.5f && v == 0.5f);
+            QVERIFY2(known, qPrintable(QStringLiteral("wedge %1 %2").arg(u).arg(v)));
+            ++checkedWedges;
+        }
+    }
+    QCOMPARE(checkedWedges, 9);
+
+    // The cap's vertices carry the tilted normal, not the quad's.
+    int tilted = 0;
+    for (const VCGVertex &v : mesh.vert) {
+        if (v.IsD())
+            continue;
+        if (std::abs(v.cN().Y() - 0.7071f) < 1e-3f)
+            ++tilted;
+    }
+    QCOMPARE(tilted, 3);
 }
 
 void DocumentTests::saveAndLoadEmbeddedGLBTexture()

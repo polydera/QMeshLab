@@ -47,7 +47,11 @@ QString extensionOf(const QString &filename)
 // Copy a trueform polygons_buffer into a VCGMesh, triangulating by fan. TrueForm's OBJ
 // reader returns dynamic-size faces (n-gons); its STL reader always returns triangles.
 template <typename Buffer>
-bool copyToVcgMesh(const Buffer &buffer, VCGMesh &mesh)
+bool copyToVcgMesh(
+    const Buffer &buffer,
+    VCGMesh &mesh,
+    const tf::unit_vectors_buffer<float, 3> *pointNormals = nullptr,
+    const tf::vectors_buffer<float, 2> *pointTexcoords = nullptr)
 {
     mesh.Clear();
 
@@ -57,9 +61,18 @@ bool copyToVcgMesh(const Buffer &buffer, VCGMesh &mesh)
         return false;
 
     vcg::tri::Allocator<VCGMesh>::AddVertices(mesh, int(pointCount));
+    const bool hasNormals =
+        pointNormals && std::size_t(pointNormals->size()) == pointCount;
+    const bool hasTexcoords =
+        pointTexcoords && std::size_t(pointTexcoords->size()) == pointCount;
+
     std::size_t vi = 0;
     for (const auto &p : points) {
         mesh.vert[vi].P() = vcg::Point3f(float(p[0]), float(p[1]), float(p[2]));
+        if (hasNormals) {
+            const auto n = (*pointNormals)[vi];
+            mesh.vert[vi].N() = vcg::Point3f(n[0], n[1], n[2]);
+        }
         ++vi;
     }
 
@@ -79,14 +92,27 @@ bool copyToVcgMesh(const Buffer &buffer, VCGMesh &mesh)
                 continue;
             if (a == b || b == c || a == c)
                 continue;
-            vcg::tri::Allocator<VCGMesh>::AddFace(mesh, a, b, c);
+            auto fi = vcg::tri::Allocator<VCGMesh>::AddFace(mesh, a, b, c);
+            if (hasTexcoords) {
+                const int corner[3] = { a, b, c };
+                for (int w = 0; w < 3; ++w) {
+                    const auto t = (*pointTexcoords)[std::size_t(corner[w])];
+                    fi->WT(w).U() = t[0];
+                    fi->WT(w).V() = t[1];
+                    fi->WT(w).N() = 0;
+                }
+            }
         }
     }
 
     vcg::tri::Allocator<VCGMesh>::CompactEveryVector(mesh);
     vcg::tri::UpdateBounding<VCGMesh>::Box(mesh);
-    if (mesh.FN() > 0)
-        vcg::tri::UpdateNormal<VCGMesh>::PerVertexNormalizedPerFaceNormalized(mesh);
+    if (mesh.FN() > 0) {
+        if (hasNormals)
+            vcg::tri::UpdateNormal<VCGMesh>::PerFaceNormalized(mesh);
+        else
+            vcg::tri::UpdateNormal<VCGMesh>::PerVertexNormalizedPerFaceNormalized(mesh);
+    }
     return true;
 }
 
@@ -139,8 +165,8 @@ tf::polygons_buffer<int, float, 3, 3> makeTrueFormTriangles(const VCGMesh &mesh)
 //  - STL import **deduplicates vertices while loading**. STL is a triangle soup with no
 //    shared vertices, so every other reader yields a mesh needing "Remove Duplicate
 //    Vertices" afterwards; this one arrives welded.
-//  - OBJ import reads **vertex positions and faces only** — no UVs, normals or
-//    materials. For a textured OBJ, use io_vcg or io_obj_rapidobj instead.
+//  - OBJ import reads positions, faces, per-vertex normals and texture
+//    coordinates (tf::read_obj with tf::complete). Materials are not read.
 class TrueFormIOPlugin final : public MeshIOPlugin
 {
 public:
@@ -165,10 +191,13 @@ public:
 
     MeshIOCapabilities loadCapabilities(const QString &filename) const override
     {
-        (void) filename;
-        // Geometry only: neither reader recovers UVs, normals or materials.
         MeshIOCapabilities caps;
         caps.mask = Mask::IOM_VERTCOORD | Mask::IOM_FACEINDEX;
+        // OBJ recovers per-vertex normals and texture coordinates through
+        // tf::read_obj(path, tf::complete); a position with two distinct
+        // attributes arrives pre-split. Materials are not read.
+        if (extensionOf(filename) == QStringLiteral("obj"))
+            caps.mask |= Mask::IOM_VERTNORMAL | Mask::IOM_WEDGTEXCOORD;
         return caps;
     }
 
@@ -181,6 +210,8 @@ public:
         const QString ext = extensionOf(filename);
         const std::string path = filename.toStdString();
         bool built = false;
+        bool importedNormals = false;
+        bool importedTexcoords = false;
         try {
             if (ext == QStringLiteral("stl")) {
                 const auto buffer = tf::read_stl<int>(path);
@@ -188,10 +219,16 @@ public:
                     return kErrEmpty;
                 built = copyToVcgMesh(buffer, mesh);
             } else if (ext == QStringLiteral("obj")) {
-                const auto buffer = tf::read_obj<int, float>(path);
-                if (buffer.empty())
+                const auto file = tf::read_obj(path, tf::complete);
+                if (file.polygons.empty())
                     return kErrEmpty;
-                built = copyToVcgMesh(buffer, mesh);
+                importedNormals = file.normals.size() == file.polygons.points().size();
+                importedTexcoords = file.textures.size() == file.polygons.points().size();
+                built = copyToVcgMesh(
+                    file.polygons,
+                    mesh,
+                    importedNormals ? &file.normals : nullptr,
+                    importedTexcoords ? &file.textures : nullptr);
             } else {
                 return kErrUnsupported;
             }
@@ -204,8 +241,13 @@ public:
         if (!built)
             return kErrEmpty;
 
-        if (outLoadMask)
+        if (outLoadMask) {
             *outLoadMask = Mask::IOM_VERTCOORD | Mask::IOM_FACEINDEX;
+            if (importedNormals)
+                *outLoadMask |= Mask::IOM_VERTNORMAL;
+            if (importedTexcoords)
+                *outLoadMask |= Mask::IOM_WEDGTEXCOORD;
+        }
         if (cb)
             (*cb)(100, "Done.");
         return 0;
