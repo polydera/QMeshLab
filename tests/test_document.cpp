@@ -70,6 +70,9 @@ private slots:
     void openDialogFilterContainsKnownFormats();
     void saveAndLoad3MFRoundTrip();
     void trueFormRoundTripsObjAndStl();
+    void trueFormImportsObjNormalsAndTexcoords();
+    void trueFormImportsObjTexcoordsWithoutNormals();
+    void trueFormImportsObjGeometryWhenFacesDisagreeOnAttributes();
     void polygonalOffExportKeepsEveryWellFormedQuad();
     void plyWithLongPerVertexListLoads();
     void polygonalOffExportSurvivesMalformedFaces();
@@ -1429,6 +1432,185 @@ void DocumentTests::trueFormRoundTripsObjAndStl()
         QVERIFY2(std::abs(box.DimY() - 3.0f) < 1e-3f, qPrintable(ext));
     }
 }
+
+// The TrueForm OBJ reader returns normals and texture coordinates only when every
+// face of the file names the same attributes, so the three cases below are the
+// whole contract: both attributes, one of them, and a file that disagrees with
+// itself and therefore arrives as geometry alone.
+namespace {
+
+// setPreferredImportPluginForExtension persists to QSettings, so it is process-wide
+// and outlives the test that set it. Capture and restore.
+struct TrueFormObjPreference {
+    Document *doc;
+    QString previous;
+
+    explicit TrueFormObjPreference(Document &document)
+        : doc(&document)
+        , previous(document.preferredImportPluginForExtension(QStringLiteral("obj")))
+    {
+        doc->setPreferredImportPluginForExtension(
+            QStringLiteral("obj"), QStringLiteral("qmeshlab.io.trueform"));
+    }
+
+    ~TrueFormObjPreference()
+    {
+        doc->setPreferredImportPluginForExtension(QStringLiteral("obj"), previous);
+    }
+};
+
+bool writeTextFile(const QString &path, const char *text)
+{
+    QFile out(path);
+    if (!out.open(QIODevice::WriteOnly))
+        return false;
+    return out.write(text) > 0;
+}
+
+// Every fixture below gives a vertex the texture coordinate of its own (x, y), so a
+// wedge lands on the right corner only if the reader's split vertices and the
+// importer's fan agree.
+bool wedgesMatchCornerPositions(const VCGMesh &mesh, int &checkedWedges)
+{
+    checkedWedges = 0;
+    for (const VCGFace &f : mesh.face) {
+        for (int w = 0; w < 3; ++w) {
+            const vcg::Point3f &p = f.cV(w)->cP();
+            if (std::abs(f.cWT(w).U() - p.X()) > 1e-6f
+                || std::abs(f.cWT(w).V() - p.Y()) > 1e-6f)
+                return false;
+            ++checkedWedges;
+        }
+    }
+    return true;
+}
+
+}
+
+void DocumentTests::trueFormImportsObjNormalsAndTexcoords()
+{
+    Document probe;
+    if (!probe.openDialogFilter().contains(QStringLiteral("TrueForm")))
+        QSKIP("TrueForm I/O plugin is not available in this build.");
+
+    // A quad and a cap triangle sharing two positions, each with its own normal:
+    // the shared positions arrive from the reader already split in two.
+    const char *obj =
+        "o demo\n"
+        "g quad\n"
+        "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 0.5 0.5 1\n"
+        "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvt 0.5 0.5\n"
+        "vn 0 0 1\nvn 0 0.7071 0.7071\n"
+        "f 1/1/1 2/2/1 3/3/1 4/4/1\n"
+        "g cap\n"
+        "f 1/1/2 2/2/2 5/5/2\n";
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("textured.obj"));
+    QVERIFY(writeTextFile(path, obj));
+
+    TrueFormObjPreference preference(probe);
+    QCOMPARE(probe.loadMesh(path), 0);
+    QCOMPARE(probe.meshCount(), 1);
+
+    const Document::MeshEntry &entry = probe.mesh(0);
+    const VCGMesh &mesh = entry.mesh;
+
+    // The quad fanned into two triangles plus the cap; the two shared positions split.
+    QCOMPARE(mesh.FN(), 3);
+    QCOMPARE(mesh.VN(), 7);
+    QVERIFY(entry.ioMask & vcg::tri::io::Mask::IOM_VERTNORMAL);
+    QVERIFY(entry.ioMask & vcg::tri::io::Mask::IOM_WEDGTEXCOORD);
+    QVERIFY(mesh.face.IsWedgeTexCoordEnabled());
+
+    int checkedWedges = 0;
+    QVERIFY(wedgesMatchCornerPositions(mesh, checkedWedges));
+    QCOMPARE(checkedWedges, 9);
+
+    // The cap's three vertices carry the tilted normal, and it survives import:
+    // a recomputed normal would average the two faces meeting at the rim.
+    int tilted = 0;
+    for (const VCGVertex &v : mesh.vert) {
+        if (std::abs(v.cN().Y() - 0.7071f) < 1e-3f)
+            ++tilted;
+    }
+    QCOMPARE(tilted, 3);
+}
+
+void DocumentTests::trueFormImportsObjTexcoordsWithoutNormals()
+{
+    Document probe;
+    if (!probe.openDialogFilter().contains(QStringLiteral("TrueForm")))
+        QSKIP("TrueForm I/O plugin is not available in this build.");
+
+    // The fifth position is named by no face: the complete read builds its vertices
+    // from the faces, so a stray position does not reach the layer.
+    const char *obj =
+        "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 5 5 5\n"
+        "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n"
+        "f 1/1 2/2 3/3\n"
+        "f 1/1 3/3 4/4\n";
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("uv_only.obj"));
+    QVERIFY(writeTextFile(path, obj));
+
+    TrueFormObjPreference preference(probe);
+    QCOMPARE(probe.loadMesh(path), 0);
+    QCOMPARE(probe.meshCount(), 1);
+
+    const Document::MeshEntry &entry = probe.mesh(0);
+    const VCGMesh &mesh = entry.mesh;
+
+    QCOMPARE(mesh.FN(), 2);
+    QCOMPARE(mesh.VN(), 4);
+    // One attribute present is one attribute claimed.
+    QVERIFY(entry.ioMask & vcg::tri::io::Mask::IOM_WEDGTEXCOORD);
+    QVERIFY(!(entry.ioMask & vcg::tri::io::Mask::IOM_VERTNORMAL));
+
+    int checkedWedges = 0;
+    QVERIFY(wedgesMatchCornerPositions(mesh, checkedWedges));
+    QCOMPARE(checkedWedges, 6);
+}
+
+void DocumentTests::trueFormImportsObjGeometryWhenFacesDisagreeOnAttributes()
+{
+    Document probe;
+    if (!probe.openDialogFilter().contains(QStringLiteral("TrueForm")))
+        QSKIP("TrueForm I/O plugin is not available in this build.");
+
+    // The first face names a texture coordinate and the second does not. The
+    // complete read refuses such a file outright rather than inventing the missing
+    // wedges, so the importer falls back to the positions-only read: the geometry
+    // arrives whole and no attribute is claimed for either face.
+    const char *obj =
+        "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
+        "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n"
+        "f 1/1 2/2 3/3\n"
+        "f 1 3 4\n";
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("half_textured.obj"));
+    QVERIFY(writeTextFile(path, obj));
+
+    TrueFormObjPreference preference(probe);
+    QCOMPARE(probe.loadMesh(path), 0);
+    QCOMPARE(probe.meshCount(), 1);
+
+    const Document::MeshEntry &entry = probe.mesh(0);
+    const VCGMesh &mesh = entry.mesh;
+
+    QCOMPARE(mesh.FN(), 2);
+    QCOMPARE(mesh.VN(), 4);
+    QVERIFY(!(entry.ioMask & vcg::tri::io::Mask::IOM_WEDGTEXCOORD));
+    QVERIFY(!(entry.ioMask & vcg::tri::io::Mask::IOM_VERTNORMAL));
+    // The mask is honest about the mesh: the component is not there to read.
+    QVERIFY(!mesh.face.IsWedgeTexCoordEnabled());
+}
+
 
 void DocumentTests::saveAndLoadEmbeddedGLBTexture()
 {
