@@ -343,7 +343,7 @@
         {
           "id": "firstMesh",
           "label": "Layer to Cut",
-          "help": "The first operand.",
+          "help": "The layer the second is removed from.",
           "group": "main",
           "type": "mesh",
           "default": "@currentMeshIndex"
@@ -351,7 +351,7 @@
         {
           "id": "secondMesh",
           "label": "Layer to Subtract",
-          "help": "The second operand.",
+          "help": "The layer removed from the first.",
           "group": "main",
           "type": "mesh",
           "default": "@otherMeshIndex"
